@@ -1,98 +1,156 @@
-// chat_server.cpp
-// Multi-threaded Chat Server using C++ and Socket Programming
-// Includes: Socket creation, Client handling, MySQL integration, AES encryption, and Password hashing
+
+// server.cpp
 
 #include <iostream>
-#include <thread>
-#include <vector>
-#include <mutex>
-#include <map>
 #include <cstring>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <mysql/mysql.h>
-#include <openssl/sha.h>
+#include <pthread.h>
 #include <openssl/aes.h>
+#include <openssl/sha.h>
+#include <mysql/mysql.h>
 
 #define PORT 8080
-#define BUFFER_SIZE 1024
+#define MAX_CLIENTS 10
+#define AES_KEY "thisisasecretkey"  // 16-byte AES key
 
-std::vector<int> clients;
-std::mutex clients_mutex;
+using namespace std;
 
-MYSQL *conn;
+int clients[MAX_CLIENTS];
+pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-void broadcastMessage(const std::string &message, int sender_fd) {
-    std::lock_guard<std::mutex> lock(clients_mutex);
-    for (int client : clients) {
-        if (client != sender_fd) {
-            send(client, message.c_str(), message.size(), 0);
-        }
-    }
+// AES encryption/decryption
+void aes_encrypt(const char *input, unsigned char *output) {
+    AES_KEY enc_key;
+    AES_set_encrypt_key((const unsigned char *)AES_KEY, 128, &enc_key);
+    AES_encrypt((const unsigned char *)input, output, &enc_key);
 }
 
-std::string hashPassword(const std::string &password) {
-    unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256((const unsigned char*)password.c_str(), password.size(), hash);
-    char hexstr[65];
-    for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i)
-        sprintf(hexstr + i * 2, "%02x", hash[i]);
-    hexstr[64] = 0;
-    return std::string(hexstr);
+void aes_decrypt(const unsigned char *input, char *output) {
+    AES_KEY dec_key;
+    AES_set_decrypt_key((const unsigned char *)AES_KEY, 128, &dec_key);
+    AES_decrypt(input, (unsigned char *)output, &dec_key);
 }
 
-bool verifyUser(const std::string &username, const std::string &password) {
-    std::string hashed = hashPassword(password);
-    std::string query = "SELECT * FROM users WHERE username='" + username + "' AND password_hash='" + hashed + "'";
-    if (mysql_query(conn, query.c_str()) == 0) {
-        MYSQL_RES *res = mysql_store_result(conn);
-        bool valid = mysql_num_rows(res) > 0;
-        mysql_free_result(res);
-        return valid;
-    }
-    return false;
+// SHA-256 hash for password
+string sha256(const string &str) {
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256((const unsigned char *)str.c_str(), str.size(), hash);
+    char output[65];
+    for (int i = 0; i < 32; i++) sprintf(output + (i * 2), "%02x", hash[i]);
+    output[64] = 0;
+    return string(output);
 }
 
-void handleClient(int client_socket) {
-    char buffer[BUFFER_SIZE];
-    int bytesReceived;
-    while ((bytesReceived = recv(client_socket, buffer, BUFFER_SIZE - 1, 0)) > 0) {
-        buffer[bytesReceived] = '\0';
-        std::string message(buffer);
-        broadcastMessage(message, client_socket);
-    }
-    close(client_socket);
-    std::lock_guard<std::mutex> lock(clients_mutex);
-    clients.erase(std::remove(clients.begin(), clients.end(), client_socket), clients.end());
+// MySQL login/register logic
+bool handle_auth(MYSQL *conn, const string &username, const string &password, bool isRegister) {
+    string hash = sha256(password);
+    MYSQL_RES *res;
+    MYSQL_ROW row;
+
+    if (isRegister) {
+        string checkQuery = "SELECT * FROM users WHERE username = '" + username + "'";
+        mysql_query(conn, checkQuery.c_str());
+        res = mysql_store_result(conn);
+        if (mysql_num_rows(res) > 0) return false; // already exists
+
+        string insertQuery = "INSERT INTO users(username, password) VALUES('" + username + "','" + hash + "')";
+        return mysql_query(conn, insertQuery.c_str()) == 0;
+    } else {
+        string query = "SELECT * FROM users WHERE username='" + username + "' AND password='" + hash + "'";
+        mysql_query(conn, query.c_str());
+        res = mysql_store_result(conn);
+        return mysql_num_rows(res) > 0;
+    }
+}
+
+void *handle_client(void *arg) {
+    int sock = *(int *)arg;
+    char buffer[1024];
+    MYSQL *conn = mysql_init(NULL);
+    mysql_real_connect(conn, "localhost", "root", "password", "chatdb", 0, NULL, 0);
+
+    // Receive auth type
+    read(sock, buffer, 1024);
+    bool isRegister = strcmp(buffer, "register") == 0;
+
+    // Receive username and password
+    read(sock, buffer, 1024);
+    string username(buffer);
+    read(sock, buffer, 1024);
+    string password(buffer);
+
+    if (!handle_auth(conn, username, password, isRegister)) {
+        write(sock, "fail", 4);
+        close(sock);
+        return NULL;
+    }
+
+    write(sock, "success", 7);
+
+    // Now enter chat loop
+    while (true) {
+        unsigned char encrypted[128];
+        int bytes = read(sock, encrypted, 128);
+        if (bytes <= 0) break;
+
+        char decrypted[128] = {0};
+        aes_decrypt(encrypted, decrypted);
+        printf("[%s]: %s\n", username.c_str(), decrypted);
+
+        pthread_mutex_lock(&clients_mutex);
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i] != 0 && clients[i] != sock) {
+                write(clients[i], encrypted, 128);
+            }
+        }
+        pthread_mutex_unlock(&clients_mutex);
+    }
+
+    close(sock);
+    mysql_close(conn);
+
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i] == sock) {
+            clients[i] = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+
+    return NULL;
 }
 
 int main() {
-    conn = mysql_init(NULL);
-    if (!mysql_real_connect(conn, "localhost", "root", "", "chat_app", 0, NULL, 0)) {
-        std::cerr << "MySQL connection failed: " << mysql_error(conn) << std::endl;
-        return 1;
-    }
+    int server_fd, new_socket;
+    struct sockaddr_in address;
+    socklen_t addrlen = sizeof(address);
 
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in server_addr{};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
 
-    bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
-    listen(server_fd, 10);
-    std::cout << "Server started on port " << PORT << "...\n";
+    bind(server_fd, (struct sockaddr *)&address, sizeof(address));
+    listen(server_fd, 5);
 
-    while (true) {
-        sockaddr_in client_addr;
-        socklen_t addr_len = sizeof(client_addr);
-        int client_socket = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
+    cout << "Server listening on port " << PORT << endl;
 
-        std::lock_guard<std::mutex> lock(clients_mutex);
-        clients.push_back(client_socket);
+    while (true) {
+        new_socket = accept(server_fd, (struct sockaddr *)&address, &addrlen);
 
-        std::thread(handleClient, client_socket).detach();
-    }
-    mysql_close(conn);
-    return 0;
+        pthread_mutex_lock(&clients_mutex);
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i] == 0) {
+                clients[i] = new_socket;
+                pthread_t tid;
+                pthread_create(&tid, NULL, handle_client, &clients[i]);
+                break;
+            }
+        }
+        pthread_mutex_unlock(&clients_mutex);
+    }
+
+    return 0;
 }
